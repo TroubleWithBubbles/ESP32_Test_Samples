@@ -1,0 +1,230 @@
+//Test Menü für Venturi
+
+//	Komponenten: 
+//	https://de.farnell.com/bourns/pec11r-4215f-s0024/inkrementalgeber-2ch-24impulse/dp/2474844
+//	https://cdn.shopify.com/s/files/1/0835/6554/3751/files/VM001_eBook_1.pdf?v=1721975241
+//	https://www.amazon.de/dp/B0CXY88HBN?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1
+
+
+Code
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+// I2C-Adresse für das OLED Display (häufig 0x3C)
+#define OLED_ADDR 0x3C
+
+// Erstelle ein SSD1306 Display Objekt
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Definition für den Encoder
+#define CLK_PIN 18  // Pin A des Encoders
+#define DT_PIN 19   // Pin B des Encoders
+#define SW_PIN 15   // Pin 1 des Encoders (Pushbutton)
+
+// Variablen für die Menülogik
+volatile int currentMenuIndex = 0;
+const char* menuItems[] = {"Volumenstrom", "Konzentration", "Einschaltdauer", "Ventil"};
+const int menuLength = sizeof(menuItems) / sizeof(menuItems[0]);
+
+// Einstellbare Werte
+int konzentration = 5;  // In mg/L, von 5 bis 50
+int einschaltdauer = 0; // In Sekunden, von 0 bis 100
+enum VentilStatus { AUS, AN, AUTO };
+VentilStatus ventilStatus = AUS;  // Ventil Status
+int volumenstrom = 15;  // In L/min, nur für Anzeige
+float druck = 2.8;      // Druck in bar, nur für Anzeige
+
+// Encoder-Variablen
+int lastCLK = HIGH;
+unsigned long lastEncoderChangeTime = 0;
+const unsigned long debounceDelay = 5; // Entprellzeit für den Encoder
+
+bool inEditMode = false;  // Gibt an, ob wir einen Wert bearbeiten
+unsigned long blinkTimer = 0; // Timer für Blinken der Werte
+bool showValue = true;  // Zustand für Blinken
+unsigned long animationTimer = 0; // Timer für die Tropfenanimation
+bool dropletVisible = false; // Zustandsvariable für den blinkenden Tropfen
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialisiere das Display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+
+  display.clearDisplay();
+  display.display();
+
+  // Setze die Pins als Eingänge mit Pullup-Widerstand
+  pinMode(SW_PIN, INPUT_PULLUP);
+  pinMode(CLK_PIN, INPUT_PULLUP);
+  pinMode(DT_PIN, INPUT_PULLUP);
+
+  // Zeige die Startseite
+  displayMenu();
+}
+
+void loop() {
+  // Encoder-Eingaben lesen
+  int currentCLK = digitalRead(CLK_PIN);
+
+  if (currentCLK != lastCLK) {
+    if (millis() - lastEncoderChangeTime > debounceDelay) {
+      lastEncoderChangeTime = millis();
+
+      int dtValue = digitalRead(DT_PIN);
+
+      if (currentCLK == LOW) {
+        if (dtValue != currentCLK) {
+          if (!inEditMode) {
+            // Navigiere durch das Menü
+            currentMenuIndex = (currentMenuIndex + 1) % menuLength; // Drehen im Uhrzeigersinn
+          } else {
+            // Bearbeite den aktuellen Wert
+            adjustCurrentValue(1);
+          }
+        } else {
+          if (!inEditMode) {
+            // Navigiere zurück im Menü
+            currentMenuIndex = (currentMenuIndex - 1 + menuLength) % menuLength; // Gegen den Uhrzeigersinn
+          } else {
+            // Verringere den aktuellen Wert
+            adjustCurrentValue(-1);
+          }
+        }
+        displayMenu(); // Aktualisiere die Anzeige nach jeder Änderung
+      }
+    }
+  }
+
+  lastCLK = currentCLK;
+
+  // Prüfe, ob der Drehencoder-Schalter gedrückt wurde
+  if (digitalRead(SW_PIN) == LOW) {
+    delay(50); // Kurze Entprellung des Tasters
+    if (digitalRead(SW_PIN) == LOW) {
+      inEditMode = !inEditMode; // Wechsel in den Editiermodus oder zurück
+      displayMenu(); // Anzeige aktualisieren
+      delay(300); // Entprellung
+    }
+  }
+
+  // Blinken für den Wert im Editiermodus
+  if (inEditMode && millis() - blinkTimer > 500) {
+    blinkTimer = millis();
+    showValue = !showValue;
+    displayMenu();
+  }
+
+  // Blinken des Tropfens auf der Startseite
+  if (currentMenuIndex == 0 && millis() - animationTimer > 500) {
+    animationTimer = millis();
+    if (ventilStatus == AN || ventilStatus == AUTO) {
+      dropletVisible = !dropletVisible;
+    } else {
+      dropletVisible = false; // Kein Blinken wenn Ventil AUS ist
+    }
+    displayMenu(); // Anzeige des blinkenden Tropfens aktualisieren
+  }
+}
+
+void adjustCurrentValue(int direction) {
+  switch (currentMenuIndex) {
+    case 1: // Konzentration einstellen
+      konzentration += direction * 5;
+      konzentration = constrain(konzentration, 5, 50);
+      break;
+    case 2: // Einschaltdauer einstellen
+      einschaltdauer += direction * 5;
+      einschaltdauer = constrain(einschaltdauer, 0, 100);
+      break;
+    case 3: // Ventil-Status ändern
+      if (direction != 0) {
+        ventilStatus = static_cast<VentilStatus>((ventilStatus + direction + 3) % 3); // AN, AUS, AUTO zyklisch durchlaufen
+      }
+      break;
+  }
+}
+
+void displayMenu() {
+  display.clearDisplay();
+
+  if (currentMenuIndex == 0) {
+    // Startseite: Volumenstrom und Druck anzeigen
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Volumenstrom:");
+
+    display.setTextSize(2);
+    display.setCursor(0, 20);
+    display.print(volumenstrom);
+    display.println(" L/min");
+
+    // Druckanzeige
+    display.setTextSize(1);
+    display.setCursor(0, 45);
+    display.print(druck);
+    display.println(" bar");
+
+    // Tropfen anzeigen, abhängig vom Ventilstatus
+    if (ventilStatus == AN && dropletVisible) {
+      display.fillCircle(115, 30, 5, SSD1306_WHITE); // Vergrößerter Tropfen (Radius 5)
+    } else if (ventilStatus == AUTO && dropletVisible) {
+      display.setTextSize(1);
+      display.setCursor(105, 45);
+      display.println("AUTO");
+      display.fillCircle(115, 30, 5, SSD1306_WHITE); // Vergrößerter Tropfen (Radius 5)
+    }
+  } else {
+    // Andere Menüpunkte kompakter darstellen
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+
+    switch (currentMenuIndex) {
+      case 1:
+        display.println("Konzentr.:");
+        display.setTextSize(2);
+        display.setCursor(0, 30);
+        if (!inEditMode || (inEditMode && showValue)) {
+          display.print(konzentration);
+          display.println(" mg/L");
+        }
+        break;
+      case 2:
+        display.println("Einschalt:");
+        display.setTextSize(2);
+        display.setCursor(0, 30);
+        if (!inEditMode || (inEditMode && showValue)) {
+          display.print(einschaltdauer);
+          display.println(" sek");
+        }
+        break;
+      case 3:
+        display.println("Ventil:");
+        display.setTextSize(2);
+        display.setCursor(0, 30);
+        switch (ventilStatus) {
+          case AN:
+            display.println("AN");
+            break;
+          case AUS:
+            display.println("AUS");
+            break;
+          case AUTO:
+            display.println("AUTO");
+            break;
+        }
+        break;
+    }
+  }
+
+  display.display();
+}
