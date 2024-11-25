@@ -1,0 +1,60 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128  // OLED display width, in pixels
+#define SCREEN_HEIGHT 64  // OLED display height, in pixels
+#define OLED_RESET    -1  // Reset pin # (or -1 if sharing Arduino reset pin)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Pin Definitions
+#define SENSOR_PIN_1 32  // Analog Pin for Sensor 1
+#define SENSOR_PIN_2 33  // Analog Pin for Sensor 2
+
+// Number of samples for averaging
+#define NUM_SAMPLES 10
+
+void setup() {
+  // Initialize Serial Monitor
+  Serial.begin(115200);
+
+  // Initialize the analog pins
+  pinMode(SENSOR_PIN_1, INPUT);
+  pinMode(SENSOR_PIN_2, INPUT);
+
+  // Initialize the OLED Display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {  // Address 0x3C for 128x64
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  delay(2000);
+  display.clearDisplay();
+}
+
+void loop() {
+  // Read and average analog values from sensors
+  int sensorValue1 = 0;
+  int sensorValue2 = 0;
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    sensorValue1 += analogRead(SENSOR_PIN_1);
+    sensorValue2 += analogRead(SENSOR_PIN_2);
+    delay(10); // Small delay between readings
+  }
+  sensorValue1 /= NUM_SAMPLES;
+  sensorValue2 /= NUM_SAMPLES;
+
+  // Display the sensor values on the OLED
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 10);
+  display.print("p1 = ");
+  display.print(sensorValue1);
+  display.setCursor(0, 30);
+  display.print("p2 = ");
+  display.print(sensorValue2);
+  display.display();
+
+  // Wait for 0.5 seconds
+  delay(500);
+}
