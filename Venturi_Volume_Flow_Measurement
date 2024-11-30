@@ -1,0 +1,161 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// Display-Parameter
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Definition für den Rotary-Encoder
+#define CLK_PIN 18  // Pin A des Encoders
+#define DT_PIN 19   // Pin B des Encoders
+#define SW_PIN 15   // Taster des Encoders
+
+// Sensor-Pins
+#define SENSOR1_PIN 32 // Drucksensor 1 (p1)
+#define SENSOR2_PIN 33 // Drucksensor 2 (p0)
+
+// Kalibrierungswerte
+#define P1_SLOPE 0.0015
+#define P1_INTERCEPT -0.4065
+#define P0_SLOPE 0.0015
+#define P0_INTERCEPT -0.435
+
+// Hydraulische Konstanten
+#define D1 20.4e-3   // Durchmesser bei 1 in Meter
+#define D0 7e-3      // Durchmesser bei 0 in Meter
+#define RHO 1000.0   // Dichte in kg/m^3
+#define C_EPSILON 0.9770 // Konstante
+
+// Berechnung der Fläche und des Flächenverhältnisses
+#define A_D (M_PI * (D0 / 2.0) * (D0 / 2.0)) // Querschnittsfläche von D0
+#define BETA (D0 / D1) // Flächenverhältnis von D0/D1
+
+// Gleitender Mittelwert
+#define WINDOW_SIZE 10
+int dac1_values[WINDOW_SIZE] = {0};
+int dac2_values[WINDOW_SIZE] = {0};
+int currentIndex = 0;
+
+// Variablen für den Rotary-Encoder
+int currentScreen = 0;
+bool lastButtonState = HIGH;
+
+void setup() {
+  // Serieller Monitor
+  Serial.begin(115200);
+
+  // Display initialisieren
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    while (true); // Endlosschleife bei Fehler
+  }
+
+  // Rotary-Encoder initialisieren
+  pinMode(CLK_PIN, INPUT);
+  pinMode(DT_PIN, INPUT);
+  pinMode(SW_PIN, INPUT_PULLUP); // Taster mit Pullup
+
+  // Begrüßung auf dem Display
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Willkommen!");
+  display.display();
+  delay(2000);
+}
+
+void loop() {
+  // Taster-Status für Bildschirmwechsel
+  bool buttonState = digitalRead(SW_PIN);
+  if (buttonState == LOW && lastButtonState == HIGH) {
+    currentScreen = (currentScreen + 1) % 2; // Umschalten zwischen 0 und 1
+    delay(200); // Debounce
+  }
+  lastButtonState = buttonState;
+
+  // Aktuelle ADC-Werte einlesen
+  int current_dac1 = analogRead(SENSOR1_PIN);
+  int current_dac2 = analogRead(SENSOR2_PIN);
+
+  // Werte in den Mittelwert-Puffer speichern
+  dac1_values[currentIndex] = current_dac1;
+  dac2_values[currentIndex] = current_dac2;
+  currentIndex = (currentIndex + 1) % WINDOW_SIZE;
+
+  // Gleitende Mittelwerte berechnen
+  float avg_dac1 = calculateAverage(dac1_values, WINDOW_SIZE);
+  float avg_dac2 = calculateAverage(dac2_values, WINDOW_SIZE);
+
+  // Drucke berechnen
+  float p1 = P1_SLOPE * avg_dac1 + P1_INTERCEPT; // Druck p1 in bar
+  float p0 = P0_SLOPE * avg_dac2 + P0_INTERCEPT; // Druck p0 in bar
+
+  // Drucke in Pascal umrechnen
+  float p1_pa = p1 * 1e5; // bar -> Pa
+  float p0_pa = p0 * 1e5; // bar -> Pa
+
+  // Druckdifferenz berechnen
+  float delta_p = p1_pa - p0_pa;
+
+  // Debugging-Ausgabe
+  Serial.print("P1 (Pa): ");
+  Serial.print(p1_pa);
+  Serial.print(" | P0 (Pa): ");
+  Serial.print(p0_pa);
+  Serial.print(" | Delta P (Pa): ");
+  Serial.println(delta_p);
+
+  // Volumenstrom berechnen
+  double Q_m = (delta_p > 0) ? A_D * C_EPSILON / sqrt(1.0 - pow(BETA, 4.0)) * sqrt(2.0 / RHO * delta_p) : 0.0;
+  double Q_m_m3_h = Q_m * 3600.0; // Umrechnung in m^3/h
+
+  // Bildschirme anzeigen
+  display.clearDisplay();
+  if (currentScreen == 0) {
+    // Bildschirm 0: Druck und Sensorwerte
+    display.setCursor(0, 0);
+    display.println("Druck Sensoren:");
+    display.setCursor(0, 15);
+    display.print("P1: ");
+    display.print(p1, 2);
+    display.println(" bar");
+    display.setCursor(0, 25);
+    display.print("DAC1: ");
+    display.println(avg_dac1, 0);
+    display.setCursor(0, 40);
+    display.print("P0: ");
+    display.print(p0, 2);
+    display.println(" bar");
+    display.setCursor(0, 50);
+    display.print("DAC2: ");
+    display.println(avg_dac2, 0);
+  } else if (currentScreen == 1) {
+    // Bildschirm 1: Volumenstrom
+    display.setCursor(0, 0);
+    display.println("Volumenstrom:");
+    display.setCursor(0, 20);
+    display.print("Q_m: ");
+    display.print(Q_m_m3_h, 2);
+    display.println(" m3/h");
+    display.setCursor(0, 40);
+    display.print("Delta P: ");
+    display.print(delta_p, 0);
+    display.println(" Pa");
+  }
+
+  display.display();
+  delay(100);
+}
+
+// Funktion zur Berechnung des gleitenden Mittelwerts
+float calculateAverage(int values[], int size) {
+  long sum = 0;
+  for (int i = 0; i < size; i++) {
+    sum += values[i];
+  }
+  return (float)sum / size;
+}
