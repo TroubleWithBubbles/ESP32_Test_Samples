@@ -6,7 +6,8 @@
 //	https://www.amazon.de/dp/B0CXY88HBN?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1
 
 
-Code
+//Code
+//---
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
