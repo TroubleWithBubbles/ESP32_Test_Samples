@@ -1,0 +1,36 @@
+#include <Arduino.h>
+#include <U8g2lib.h>
+
+// Display-Initialisierung (bitte anpassen, falls Du eine andere Konfiguration hast)
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+// Globale Variablen für Texte
+const char* texts[] = {
+    "Willkommen!",
+    "ESP32 Display Test",
+    "Viel Erfolg!",
+    "Mit U8g2lib.h",
+    "AZ Delivery Rocks!"
+};
+int currentTextIndex = 0;
+const int numberOfTexts = sizeof(texts) / sizeof(texts[0]);
+
+// Funktion zum Anzeigen eines Textes
+void showText(const char* text) {
+    u8g2.clearBuffer();                     // Bildschirm löschen
+    u8g2.setFont(u8g2_font_ncenB08_tr);     // Schriftart setzen
+    u8g2.drawStr(0, 24, text);              // Text zeichnen (x, y, Text)
+    u8g2.sendBuffer();                      // Puffer an das Display senden
+}
+
+void setup() {
+    u8g2.begin();                          // Display initialisieren
+    Serial.begin(115200);                  // Serielle Kommunikation starten
+    showText(texts[currentTextIndex]);     // Ersten Text anzeigen
+}
+
+void loop() {
+    delay(2000);                           // 2 Sekunden warten
+    currentTextIndex = (currentTextIndex + 1) % numberOfTexts; // Zum nächsten Text wechseln
+    showText(texts[currentTextIndex]);     // Neuen Text anzeigen
+}
