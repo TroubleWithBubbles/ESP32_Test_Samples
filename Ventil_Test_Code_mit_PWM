@@ -1,0 +1,124 @@
+
+// Dieser Code lässt solange, der Button gedrückt wird, das Ventil offen. Die Zeit wird getrackt. Es kann ein PWM Signal per Poti eingestellt werden.
+
+
+#include <Arduino.h>
+#include <U8g2lib.h>
+
+// Display-Initialisierung (bitte anpassen, falls Du eine andere Konfiguration hast)
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+// PWM-Konfiguration
+const int pwmPin = 17;   // GPIO 17
+const int potPin = 15;   // GPIO 15 (bitte anpassen, falls erforderlich)
+
+// Button-Konfiguration
+const int buttonPin = 5; // Button an PIN 5 (zieht bei Druck gegen GND)
+
+// PWM Parameter
+const unsigned long period = 1000; // Periodendauer in Millisekunden (1 Sekunde)
+unsigned long onTime = period * 60 / 100; // 60% Duty Cycle (initial)
+bool pwmState = false; // Aktueller Zustand des PWM-Pins
+unsigned long previousMillis = 0; // Für die PWM-Zeitsteuerung
+
+// Display-Aktualisierung
+unsigned long displayUpdateMillis = 0;
+const unsigned long displayInterval = 100; // Aktualisierungsintervall in Millisekunden
+
+// Button-Timer Variablen
+bool buttonActive = false;         // Gibt an, ob der Button aktuell gedrückt ist
+unsigned long pressStartTime = 0;    // Zeitpunkt des Beginns der aktuellen Betätigung
+float pressDurationSec = 0.0;        // Gemessene Druckdauer in Sekunden (mit Nachkommastelle)
+
+// Funktion zur Anzeige aller Informationen (Duty Cycle, Frequency und Timer)
+void showDisplay(int dutyCycle, unsigned long period, float timerSec) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  
+  char line1[30];
+  char line2[30];
+  char line3[30];
+  
+  snprintf(line1, sizeof(line1), "Duty Cycle: %d%%", dutyCycle);
+  // Berechne Frequenz (Hz) aus der Periodendauer in ms
+  float frequency = 1000.0 / period;
+  snprintf(line2, sizeof(line2), "Frequency: %.1f Hz", frequency);
+  snprintf(line3, sizeof(line3), "Timer: %.1f sec", timerSec);
+  
+  u8g2.drawStr(0, 16, line1);
+  u8g2.drawStr(0, 32, line2);
+  u8g2.drawStr(0, 48, line3);
+  u8g2.sendBuffer();
+}
+
+void setup() {
+  // Display initialisieren
+  u8g2.begin();
+  Serial.begin(115200);
+
+  // PWM- und Poti-Pins initialisieren
+  pinMode(pwmPin, OUTPUT);
+  pinMode(potPin, INPUT);
+  digitalWrite(pwmPin, LOW);
+
+  // Button-Pin initialisieren (internen Pullup aktivieren)
+  pinMode(buttonPin, INPUT_PULLUP);
+
+  // Initiale Anzeige (Standard: 60% Duty Cycle, 1 Hz, Timer 0.0 sec)
+  showDisplay(60, period, pressDurationSec);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  static int dutyCycle = 60; // Initialer Duty Cycle
+
+  // Button auslesen: LOW = gedrückt (weil er auf GND zieht)
+  bool isButtonPressed = (digitalRead(buttonPin) == LOW);
+
+  if (isButtonPressed) {
+    // Wenn der Button gerade neu gedrückt wurde, Timer zurücksetzen
+    if (!buttonActive) {
+      pressStartTime = currentMillis;
+      buttonActive = true;
+    }
+    // Laufende Druckdauer berechnen (in Sekunden)
+    pressDurationSec = (currentMillis - pressStartTime) / 1000.0;
+
+    // PWM-Steuerung basierend auf dem Poti-Wert:
+    int potValue = analogRead(potPin);
+    dutyCycle = map(potValue, 0, 4095, 0, 100); // Poti-Wert auf 0-100% skalieren
+    onTime = period * dutyCycle / 100;
+
+    // PWM-Logik
+    if (dutyCycle == 0) {
+      digitalWrite(pwmPin, LOW); // Duty Cycle 0%: Pin bleibt dauerhaft LOW
+      pwmState = false;
+    } else if (dutyCycle == 100) {
+      digitalWrite(pwmPin, HIGH); // Duty Cycle 100%: Pin bleibt dauerhaft HIGH
+      pwmState = true;
+    } else {
+      if (pwmState && (currentMillis - previousMillis >= onTime)) {
+        digitalWrite(pwmPin, LOW);
+        pwmState = false;
+        previousMillis = currentMillis;
+      } else if (!pwmState && (currentMillis - previousMillis >= (period - onTime))) {
+        digitalWrite(pwmPin, HIGH);
+        pwmState = true;
+        previousMillis = currentMillis;
+      }
+    }
+  } else {
+    // Button ist nicht gedrückt:
+    // PWM-Ausgang abschalten
+    digitalWrite(pwmPin, LOW);
+    // Setze den Button-Status zurück, damit beim erneuten Drücken der Timer neu startet
+    buttonActive = false;
+    // Der zuletzt gemessene Timer-Wert bleibt erhalten
+  }
+
+  // Display-Aktualisierung nur in regelmäßigen Abständen
+  if (currentMillis - displayUpdateMillis >= displayInterval) {
+    showDisplay(dutyCycle, period, pressDurationSec);
+    displayUpdateMillis = currentMillis;
+  }
+}
