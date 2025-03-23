@@ -1,0 +1,648 @@
+250323 ZwischenStand:
+- gleichunge implementiert,
+- PWM geht noch nicht und erkennund von Ventilen auch nicht
+
+
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <Preferences.h>
+#include <esp32-hal-ledc.h>
+#include <math.h>
+
+// Konstanter horizontaler Offset
+const int xShift = 2;
+
+// ----- Display & I2C -----
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ----- Pin-Belegung -----
+#define BUTTON_UP_PIN     16
+#define BUTTON_DOWN_PIN   5
+#define BUTTON_OK_PIN     17
+const int valvePins[5] = {19, 18, 13, 27, 14};  // LOW = ON, HIGH = OFF
+#define FERT_PWM_PIN      23
+
+// ----- PWM Einstellungen -----
+#define LEDC_RESOLUTION   8  // 8-Bit (0–255)
+
+// ----- Variablen für Debounce & Long-Press -----
+const unsigned long debounceDelay = 50;
+bool lastUpState = HIGH, lastDownState = HIGH, lastOkState = HIGH;
+unsigned long lastUpTime = 0, lastDownTime = 0, lastOkTime = 0;
+unsigned long okPressStartTime = 0;
+bool okLongPressHandled = false;
+unsigned long upHoldStart = 0, downHoldStart = 0, lastDosageUpdateTime = 0;
+
+// ----- Blink-Timer -----
+unsigned long lastValveUpdateTime = 0;
+bool blinkOn = true;  // 500ms
+
+// ----- Zustandsautomat -----
+enum AppState {
+  STATE_START,
+  STATE_FERTI_EDIT,
+  STATE_SETTINGS,
+  STATE_DOSIERUNG_MENU,
+  STATE_DOSIERUNG_EDIT,
+  STATE_KALIBRIERUNG_MENU,
+  STATE_KALIBRIERUNG_EDIT
+};
+AppState currentState = STATE_START;
+
+// ----- Menü-Indizes -----
+int startMenuIndex = -1;  // -1 = keine Auswahl, 0 = Ferti, 1 = Einstellungen
+int settingsMenuIndex = 0;  // 0: Dosierung, 1: Kalibrierung, 2: zurück
+int dosMenuIndex = 0, dosMenuScroll = 0;  // Dosierung
+int kalMenuIndex = 0, kalMenuScroll = 0;  // Kalibrierung
+int editingValve = 0, editingKalIndex = 0;
+
+// ----- Zeitgeber für Auto-Rücksprung -----
+unsigned long lastInteractionTime = 0;
+
+// ----- Benutzereingaben -----
+float dosage[5] = {0, 0, 0, 0, 0};
+// Kalibrierung:
+float cal_cd = 0.6;        // 0.3 - 0.9
+float cal_drossel = 0.7;   // 0.4 - 1.0
+float cal_venturi = 8.0;   // 4 - 15
+float cal_cv = 0.95;       // 0.7 - 1.0
+float d_inlet = 20.0;      // 8 - 40
+
+// ----- Düngerventil-Modus -----
+enum FertilizerState {
+  FERT_NORMAL,      // AUTO
+  FERT_ALWAYS_OFF   // off
+};
+FertilizerState fertState = FERT_NORMAL;
+
+// ----- PWM-Ergebnis-Struktur -----
+struct PWMResult {
+  int duty;
+  unsigned long period;
+};
+
+PWMResult computePWMForDosage(float dosageValue) {
+  PWMResult result;
+  if (dosageValue < 0.05) {
+    result.duty = 0;
+    result.period = 1000;
+    return result;
+  }
+  float c_ml_ml = dosageValue / 1000.0;
+  float beta = cal_venturi / d_inlet;
+  float sqrtTerm = sqrt(1 - pow(beta, 4));
+  if (sqrtTerm == 0) {
+    result.duty = 0;
+    result.period = 1000;
+    return result;
+  }
+  float c_max = (cal_cd / cal_cv) * (1.0 / sqrtTerm) * ((cal_drossel * cal_drossel) / (cal_venturi * cal_venturi));
+  float DC = c_ml_ml / c_max;
+  if (DC > 1.0) DC = 1.0;
+  if (DC < 0.0) DC = 0.0;
+  int pwmValue = (int)(DC * 255.0);
+  if (pwmValue > 255) pwmValue = 255;
+  if (pwmValue < 0) pwmValue = 0;
+  result.duty = pwmValue;
+  result.period = 1000;
+  return result;
+}
+
+float computeCmax() {
+  float beta = cal_venturi / d_inlet;
+  float sqrtTerm = sqrt(1 - pow(beta, 4));
+  if (sqrtTerm == 0) return 0;
+  float c_max = (cal_cd / cal_cv) * (1.0 / sqrtTerm) * ((cal_drossel * cal_drossel) / (cal_venturi * cal_venturi));
+  return c_max;
+}
+
+void updateFertilizerPWM() {
+  int duty;
+  float avgDosage = 0;
+  for (int i = 0; i < 5; i++) {
+    avgDosage += dosage[i];
+  }
+  avgDosage /= 5.0;
+  if (fertState == FERT_NORMAL) {
+    PWMResult pwm = computePWMForDosage(avgDosage);
+    duty = pwm.duty;
+  } else {
+    duty = 0;
+  }
+  ledcWrite(FERT_PWM_PIN, duty);
+}
+
+// ----- Debug-Ausgabe (nur eine Definition) -----
+void debugOutput() {
+  Serial.println("----- Debug Output -----");
+  for (int i = 0; i < 5; i++) {
+    int state = digitalRead(valvePins[i]);
+    Serial.print("Valve ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(state == LOW ? "ON (GND)" : "OFF (3.3V)");
+  }
+  float beta = cal_venturi / d_inlet;
+  Serial.print("beta = ");
+  Serial.println(beta, 4);
+  float sqrtTerm = sqrt(1 - pow(beta, 4));
+  if (sqrtTerm == 0) {
+    Serial.println("Fehler: Division durch 0 bei c_max Berechnung!");
+  } else {
+    float c_max = (cal_cd / cal_cv) * (1.0 / sqrtTerm) * ((cal_drossel * cal_drossel) / (cal_venturi * cal_venturi));
+    Serial.print("c_max = ");
+    Serial.println(c_max, 4);
+    float avgDosage = 0;
+    for (int i = 0; i < 5; i++) {
+      avgDosage += dosage[i];
+    }
+    avgDosage /= 5.0;
+    Serial.print("Durchschnittliche Dosierung = ");
+    Serial.print(avgDosage, 2);
+    Serial.println(" ml/L");
+    PWMResult pwm = computePWMForDosage(avgDosage);
+    Serial.print("Berechneter PWM-DutyCycle = ");
+    Serial.print(pwm.duty);
+    Serial.print(" (");
+    Serial.print((pwm.duty / 255.0) * 100.0, 1);
+    Serial.println("%)");
+    Serial.print("PWM-Periode = ");
+    Serial.print(pwm.period);
+    Serial.println(" ms");
+  }
+  Serial.println("------------------------");
+}
+
+// ----- Preferences -----
+Preferences preferencesObj;
+void loadSettings() {
+  preferencesObj.begin("settings", false);
+  for (int i = 0; i < 5; i++) {
+    String key = "dos" + String(i);
+    dosage[i] = preferencesObj.getFloat(key.c_str(), 0.0);
+  }
+  cal_cd = preferencesObj.getFloat("cal_cd", 0.6);
+  cal_drossel = preferencesObj.getFloat("cal_dros", 0.7);
+  cal_venturi = preferencesObj.getFloat("cal_venturi", 8.0);
+  cal_cv = preferencesObj.getFloat("cal_cv", 0.95);
+  d_inlet = preferencesObj.getFloat("d_inlet", 20.0);
+  preferencesObj.end();
+}
+void saveDosage(int index) {
+  preferencesObj.begin("settings", false);
+  String key = "dos" + String(index);
+  preferencesObj.putFloat(key.c_str(), dosage[index]);
+  preferencesObj.end();
+}
+void saveCalibration(int param) {
+  preferencesObj.begin("settings", false);
+  if (param == 0)
+    preferencesObj.putFloat("cal_cd", cal_cd);
+  else if (param == 1)
+    preferencesObj.putFloat("cal_dros", cal_drossel);
+  else if (param == 2)
+    preferencesObj.putFloat("cal_venturi", cal_venturi);
+  else if (param == 3)
+    preferencesObj.putFloat("cal_cv", cal_cv);
+  else if (param == 4)
+    preferencesObj.putFloat("d_inlet", d_inlet);
+  preferencesObj.end();
+}
+
+// ----- Display-Update -----
+void updateDisplay() {
+  u8g2.clearBuffer();
+  char buf[30];
+  
+  switch(currentState) {
+    case STATE_START: {
+      u8g2.setFont(u8g2_font_ncenB14_tr);
+      for (int i = 0; i < 5; i++) {
+        int x = (2 + xShift) + i * 25;
+        char numStr[3];
+        sprintf(numStr, "%d", i + 1);
+        u8g2.drawStr(x, 20, numStr);
+      }
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      const char* fertText = (fertState == FERT_NORMAL) ? "Ferti: AUTO" : "Ferti: off";
+      const char* settingText = "Einstellungen";
+      int fertY = 42, setY = 54;
+      if (startMenuIndex >= 0) {
+        if (startMenuIndex == 0) u8g2.drawStr(0 + xShift, fertY, ">");
+        if (startMenuIndex == 1) u8g2.drawStr(0 + xShift, setY, ">");
+      }
+      u8g2.drawStr(10 + xShift, fertY, fertText);
+      u8g2.drawStr(10 + xShift, setY, settingText);
+      break;
+    }
+    case STATE_FERTI_EDIT: {
+      u8g2.setFont(u8g2_font_ncenB14_tr);
+      for (int i = 0; i < 5; i++) {
+        int x = (2 + xShift) + i * 25;
+        char numStr[3];
+        sprintf(numStr, "%d", i + 1);
+        u8g2.drawStr(x, 20, numStr);
+      }
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      const char* fertText = (blinkOn) ? ((fertState == FERT_NORMAL) ? "Ferti: AUTO" : "Ferti: off") : "";
+      int xPos = (128 - u8g2.getStrWidth("Ferti: AUTO")) / 2 + xShift;
+      u8g2.drawStr(xPos, 42, fertText);
+      const char* settingText = "Einstellungen";
+      xPos = (128 - u8g2.getStrWidth(settingText)) / 2 + xShift;
+      u8g2.drawStr(xPos, 54, settingText);
+      u8g2.drawStr(0 + xShift, 42, ">");
+      break;
+    }
+    case STATE_SETTINGS: {
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      if (settingsMenuIndex == 0)
+        u8g2.drawStr(0 + xShift, 16, "> Dosierung");
+      else
+        u8g2.drawStr(10 + xShift, 16, "Dosierung");
+      if (settingsMenuIndex == 1)
+        u8g2.drawStr(0 + xShift, 32, "> Kalibrierung");
+      else
+        u8g2.drawStr(10 + xShift, 32, "Kalibrierung");
+      if (settingsMenuIndex == 2)
+        u8g2.drawStr(0 + xShift, 48, "> <--");
+      else
+        u8g2.drawStr(10 + xShift, 48, "<--");
+      break;
+    }
+    case STATE_DOSIERUNG_MENU: {
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      int totalItems = 6;
+      if (dosMenuIndex < dosMenuScroll)
+        dosMenuScroll = dosMenuIndex;
+      else if (dosMenuIndex > dosMenuScroll + 2)
+        dosMenuScroll = dosMenuIndex - 2;
+      for (int i = dosMenuScroll; i < dosMenuScroll + 3 && i < totalItems; i++) {
+        int y = 16 + (i - dosMenuScroll) * 16;
+        if (i < 5) {
+          if (dosage[i] < 0.05)
+            sprintf(buf, "Valve %d: OFF", i + 1);
+          else
+            sprintf(buf, "Valve %d: %.2f", i + 1, dosage[i]);
+        } else {
+          strcpy(buf, "<--");
+        }
+        if (i == dosMenuIndex)
+          u8g2.drawStr(0 + xShift, y, ">");
+        u8g2.drawStr(15 + xShift, y, buf);
+      }
+      break;
+    }
+    case STATE_DOSIERUNG_EDIT: {
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      sprintf(buf, "Valve %d Dosierung:", editingValve + 1);
+      u8g2.drawStr(0 + xShift, 20, buf);
+      float maxDosage = computeCmax() * 1000.0;
+      if (dosage[editingValve] > maxDosage)
+        dosage[editingValve] = maxDosage;
+      if (dosage[editingValve] < 0.05)
+        u8g2.drawStr(0 + xShift, 40, "OFF");
+      else {
+        sprintf(buf, "%.2f ml/L", dosage[editingValve]);
+        u8g2.drawStr(0 + xShift, 40, buf);
+      }
+      u8g2.drawStr(0 + xShift, 60, "OK: Speichern");
+      break;
+    }
+    case STATE_KALIBRIERUNG_MENU: {
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      int totalItems = 6;
+      if (kalMenuIndex < kalMenuScroll)
+        kalMenuScroll = kalMenuIndex;
+      else if (kalMenuIndex > kalMenuScroll + 2)
+        kalMenuScroll = kalMenuIndex - 2;
+      for (int i = kalMenuScroll; i < kalMenuScroll + 3 && i < totalItems; i++) {
+        int y = 16 + (i - kalMenuScroll) * 16;
+        if (i == 0)
+          sprintf(buf, "CD: %.2f", cal_cd);
+        else if (i == 1)
+          sprintf(buf, "D-Drossel: %.2f", cal_drossel);
+        else if (i == 2)
+          sprintf(buf, "D-Throat: %.2f", cal_venturi);
+        else if (i == 3)
+          sprintf(buf, "CV Range: %.2f", cal_cv);
+        else if (i == 4)
+          sprintf(buf, "D-Inlet: %.0f", d_inlet);
+        else
+          strcpy(buf, "<--");
+        if (i == kalMenuIndex)
+          u8g2.drawStr(0 + xShift, y, ">");
+        u8g2.drawStr(15 + xShift, y, buf);
+      }
+      break;
+    }
+    case STATE_KALIBRIERUNG_EDIT: {
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      if (editingKalIndex == 0) {
+        u8g2.drawStr(0 + xShift, 20, "Einstellen CD:");
+        sprintf(buf, "%.2f", cal_cd);
+      } else if (editingKalIndex == 1) {
+        u8g2.drawStr(0 + xShift, 20, "Einstellen D-Drossel:");
+        sprintf(buf, "%.2f", cal_drossel);
+      } else if (editingKalIndex == 2) {
+        u8g2.drawStr(0 + xShift, 20, "Einstellen D-Throat:");
+        sprintf(buf, "%.2f", cal_venturi);
+      } else if (editingKalIndex == 3) {
+        u8g2.drawStr(0 + xShift, 20, "Einstellen CV Range:");
+        sprintf(buf, "%.2f", cal_cv);
+      } else if (editingKalIndex == 4) {
+        u8g2.drawStr(0 + xShift, 20, "Einstellen D-Inlet:");
+        sprintf(buf, "%.0f", d_inlet);
+      }
+      u8g2.drawStr(0 + xShift, 40, buf);
+      u8g2.drawStr(0 + xShift, 60, "OK: Speichern");
+      break;
+    }
+  }
+  u8g2.sendBuffer();
+}
+
+// ----- Button-Handler -----
+void handleOkShortPress() {
+  lastInteractionTime = millis();
+  Serial.println("OK short press");
+  switch (currentState) {
+    case STATE_START:
+      if (startMenuIndex >= 0) {
+        if (startMenuIndex == 0)
+          currentState = STATE_FERTI_EDIT;
+        else {
+          currentState = STATE_SETTINGS;
+          settingsMenuIndex = 0;
+        }
+      }
+      break;
+    case STATE_FERTI_EDIT:
+      currentState = STATE_START;
+      startMenuIndex = -1;
+      break;
+    case STATE_SETTINGS:
+      if (settingsMenuIndex == 0) {
+        currentState = STATE_DOSIERUNG_MENU;
+        dosMenuIndex = 0;
+        dosMenuScroll = 0;
+      } else if (settingsMenuIndex == 1) {
+        currentState = STATE_KALIBRIERUNG_MENU;
+        kalMenuIndex = 0;
+        kalMenuScroll = 0;
+      } else if (settingsMenuIndex == 2) {
+        currentState = STATE_START;
+        startMenuIndex = -1;
+      }
+      break;
+    case STATE_DOSIERUNG_MENU:
+      if (dosMenuIndex < 5) {
+        currentState = STATE_DOSIERUNG_EDIT;
+        editingValve = dosMenuIndex;
+      } else {
+        currentState = STATE_SETTINGS;
+      }
+      break;
+    case STATE_DOSIERUNG_EDIT:
+      saveDosage(editingValve);
+      Serial.print("Saved dosage for valve ");
+      Serial.print(editingValve + 1);
+      Serial.print(": ");
+      Serial.println(dosage[editingValve]);
+      currentState = STATE_DOSIERUNG_MENU;
+      break;
+    case STATE_KALIBRIERUNG_MENU:
+      if (kalMenuIndex < 5) {
+        currentState = STATE_KALIBRIERUNG_EDIT;
+        editingKalIndex = kalMenuIndex;
+      } else {
+        currentState = STATE_SETTINGS;
+      }
+      break;
+    case STATE_KALIBRIERUNG_EDIT:
+      saveCalibration(editingKalIndex);
+      Serial.println("Calibration saved");
+      currentState = STATE_KALIBRIERUNG_MENU;
+      break;
+    default:
+      break;
+  }
+}
+
+void handleUpPress() {
+  lastInteractionTime = millis();
+  Serial.println("UP pressed");
+  if (currentState == STATE_START) {
+    if (startMenuIndex < 0) {
+      startMenuIndex = 0;
+    } else {
+      startMenuIndex = (startMenuIndex - 1 + 2) % 2;
+    }
+  }
+  else if (currentState == STATE_FERTI_EDIT) {
+    fertState = (fertState == FERT_NORMAL) ? FERT_ALWAYS_OFF : FERT_NORMAL;
+  }
+  else if (currentState == STATE_SETTINGS) {
+    settingsMenuIndex = (settingsMenuIndex - 1 + 3) % 3;
+  }
+  else if (currentState == STATE_DOSIERUNG_MENU) {
+    dosMenuIndex = (dosMenuIndex - 1 + 6) % 6;
+  }
+  else if (currentState == STATE_DOSIERUNG_EDIT) {
+    dosage[editingValve] += 0.05;
+    float maxDosage = computeCmax() * 1000.0;
+    if (dosage[editingValve] > maxDosage)
+      dosage[editingValve] = maxDosage;
+  }
+  else if (currentState == STATE_KALIBRIERUNG_MENU) {
+    kalMenuIndex = (kalMenuIndex - 1 + 6) % 6;
+  }
+  else if (currentState == STATE_KALIBRIERUNG_EDIT) {
+    if (editingKalIndex == 0) {
+      cal_cd += 0.02;
+      if (cal_cd > 0.9) cal_cd = 0.9;
+    } else if (editingKalIndex == 1) {
+      cal_drossel += 0.1;
+      if (cal_drossel > 1.0) cal_drossel = 1.0;
+    } else if (editingKalIndex == 2) {
+      cal_venturi += 1;
+      if (cal_venturi > 15) cal_venturi = 15;
+    } else if (editingKalIndex == 3) {
+      cal_cv += 0.01;
+      if (cal_cv > 1.0) cal_cv = 1.0;
+    } else if (editingKalIndex == 4) {
+      d_inlet += 1;
+      if (d_inlet > 40) d_inlet = 40;
+    }
+  }
+}
+
+void handleDownPress() {
+  lastInteractionTime = millis();
+  Serial.println("DOWN pressed");
+  if (currentState == STATE_START) {
+    if (startMenuIndex < 0) {
+      startMenuIndex = 0;
+    } else {
+      startMenuIndex = (startMenuIndex + 1) % 2;
+    }
+  }
+  else if (currentState == STATE_FERTI_EDIT) {
+    fertState = (fertState == FERT_NORMAL) ? FERT_ALWAYS_OFF : FERT_NORMAL;
+  }
+  else if (currentState == STATE_SETTINGS) {
+    settingsMenuIndex = (settingsMenuIndex + 1) % 3;
+  }
+  else if (currentState == STATE_DOSIERUNG_MENU) {
+    dosMenuIndex = (dosMenuIndex + 1) % 6;
+  }
+  else if (currentState == STATE_DOSIERUNG_EDIT) {
+    dosage[editingValve] -= 0.05;
+    if (dosage[editingValve] < 0)
+      dosage[editingValve] = 0;
+  }
+  else if (currentState == STATE_KALIBRIERUNG_MENU) {
+    kalMenuIndex = (kalMenuIndex + 1) % 6;
+  }
+  else if (currentState == STATE_KALIBRIERUNG_EDIT) {
+    if (editingKalIndex == 0) {
+      cal_cd -= 0.02;
+      if (cal_cd < 0.3) cal_cd = 0.3;
+    } else if (editingKalIndex == 1) {
+      cal_drossel -= 0.1;
+      if (cal_drossel < 0.4) cal_drossel = 0.4;
+    } else if (editingKalIndex == 2) {
+      cal_venturi -= 1;
+      if (cal_venturi < 4) cal_venturi = 4;
+    } else if (editingKalIndex == 3) {
+      cal_cv -= 0.01;
+      if (cal_cv < 0.7) cal_cv = 0.7;
+    } else if (editingKalIndex == 4) {
+      d_inlet -= 1;
+      if (d_inlet < 8) d_inlet = 8;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Setup startet");
+  Wire.begin(21, 22);
+  Serial.println("I2C gestartet");
+  u8g2.begin();
+  Serial.println("Display initialisiert");
+  
+  pinMode(BUTTON_UP_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_DOWN_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_OK_PIN, INPUT_PULLUP);
+  
+  for (int i = 0; i < 5; i++) {
+    pinMode(valvePins[i], INPUT);
+    Serial.print("Valve-Pin ");
+    Serial.print(valvePins[i]);
+    Serial.println(" als INPUT konfiguriert");
+  }
+  
+  if (ledcAttach(FERT_PWM_PIN, 1, LEDC_RESOLUTION))
+    Serial.println("LEDC attached successfully");
+  else
+    Serial.println("LEDC attach failed");
+  
+  loadSettings();
+  lastInteractionTime = millis();
+}
+
+unsigned long lastDebugTime = 0;
+const unsigned long debugInterval = 5000;
+
+void loop() {
+  unsigned long now = millis();
+  
+  if (currentState != STATE_START && currentState != STATE_FERTI_EDIT) {
+    if (now - lastInteractionTime > 8000) {
+      currentState = STATE_START;
+      startMenuIndex = -1;
+      Serial.println("Auto return to Startseite");
+    }
+  }
+  
+  if (now - lastValveUpdateTime >= 500) {
+    lastValveUpdateTime = now;
+    blinkOn = !blinkOn;
+  }
+  
+  if (now - lastDebugTime >= debugInterval) {
+    debugOutput();
+    lastDebugTime = now;
+  }
+  
+  bool upReading = (digitalRead(BUTTON_UP_PIN) == LOW);
+  bool downReading = (digitalRead(BUTTON_DOWN_PIN) == LOW);
+  bool okReading = (digitalRead(BUTTON_OK_PIN) == LOW);
+  
+  static bool lastOkHandled = false;
+  if (okReading != lastOkState) {
+    lastOkTime = now;
+    lastOkState = okReading;
+    if (okReading) {
+      okPressStartTime = now;
+      okLongPressHandled = false;
+      lastOkHandled = false;
+    } else {
+      if (!okLongPressHandled && !lastOkHandled && (now - okPressStartTime < 3000)) {
+        handleOkShortPress();
+        lastOkHandled = true;
+      }
+      okPressStartTime = 0;
+    }
+  }
+  
+  if (upReading != lastUpState) {
+    lastUpTime = now;
+    lastUpState = upReading;
+    if (upReading) {
+      upHoldStart = now;
+      handleUpPress();
+    }
+  }
+  
+  if (downReading != lastDownState) {
+    lastDownTime = now;
+    lastDownState = downReading;
+    if (downReading) {
+      downHoldStart = now;
+      handleDownPress();
+    }
+  }
+  
+  if (currentState == STATE_DOSIERUNG_EDIT) {
+    if (digitalRead(BUTTON_UP_PIN) == LOW) {
+      if (upHoldStart != 0 && (now - upHoldStart >= 1000) && (now - lastDosageUpdateTime >= 100)) {
+        dosage[editingValve] += 0.05;
+        float maxDosage = computeCmax() * 1000.0;
+        if (dosage[editingValve] > maxDosage)
+          dosage[editingValve] = maxDosage;
+        lastDosageUpdateTime = now;
+      }
+    } else {
+      upHoldStart = 0;
+    }
+    if (digitalRead(BUTTON_DOWN_PIN) == LOW) {
+      if (downHoldStart != 0 && (now - downHoldStart >= 1000) && (now - lastDosageUpdateTime >= 100)) {
+        dosage[editingValve] -= 0.05;
+        if (dosage[editingValve] < 0)
+          dosage[editingValve] = 0;
+        lastDosageUpdateTime = now;
+      }
+    } else {
+      downHoldStart = 0;
+    }
+  }
+  
+  updateFertilizerPWM();
+  updateDisplay();
+  
+  delay(10);
+}
+
