@@ -1,0 +1,217 @@
+/*
+  Experimentier-Code für den ESP32
+
+  Dieser Code misst kontinuierlich aktuelle Sensorwerte von zwei Drucksensoren (P1 und P2)
+  und einem Q-Sensor. Die Drucksensoren werden über ADC-Eingänge ausgelesen und in Druck (bar)
+  umgerechnet, während der Q-Sensor per pulseIn die Frequenz (Hz) misst. Daraus wird der
+  Volumenstrom in l/min (Q = f / 4,8) berechnet.
+
+  Der ESP32 agiert außerdem als Access Point (SSID: "ESP32_Experiment", PW: "12345678")
+  und stellt einen einfachen Webserver bereit, über den der komplette CSV-Datenlog (alle
+  Experimente bleiben im RAM bis zum Neustart) abgerufen werden kann (IP: 192.168.4.1).
+
+Dazu einfach mit dem Wlan des ESP Verbinden und die IP aurfrufen.
+
+
+  Mit einem Taster, der an GPIO23 angeschlossen ist (aktiv LOW, interner Pullup), kann ein
+  Experiment gestartet bzw. beendet werden. Während eines aktiven Experiments werden alle 0,5 s
+  die aktuellen Messwerte (relative Zeit, ADC-Werte, berechnete Drücke, Frequenz und Volumenstrom)
+  in einen CSV-Datenlog geschrieben. Gleichzeitig werden die aktuellen Messwerte permanent
+  auf einem OLED-Display (SSD1306, angesteuert über U8g2) angezeigt. Sobald ein Experiment läuft,
+  wird oben rechts im Display zusätzlich die verstrichene Zeit angezeigt.
+
+  Nutzung:
+  - Schließe die Sensoren wie folgt an:
+      P1: GPIO15 (ADC)
+      P2: GPIO32 (ADC1, da ADC2 bei aktivem WiFi nicht zuverlässig nutzbar ist)
+      Q-Sensor: GPIO16 (digitaler Eingang, PWM-Signal)
+  - Der Taster (für Start/Stop des Experiments) wird an GPIO23 angeschlossen und gegen GND gezogen.
+  - Nach dem Hochfahren startet der ESP32 seinen eigenen WLAN-Access Point.
+    Verbinde Deinen Rechner mit dem Netzwerk "ESP32_Experiment" (Passwort: "12345678").
+  - Öffne dann einen Webbrowser und rufe die IP 192.168.4.1 auf, um den CSV-Datenlog
+    (Messdaten aller Experimente) abzurufen. Diese Daten können direkt in Excel kopiert werden.
+  - Während des Betriebs zeigt das OLED-Display die aktuellen Messwerte an. Wenn ein Experiment
+    aktiv ist, erscheint oben rechts im Display die verstrichene Zeit.
+*/
+
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <U8g2lib.h>
+
+// ----- Pin-Konfiguration -----
+#define SENSOR_P1_PIN 32   // Drucksensor P1 an GPIO15
+#define SENSOR_P2_PIN 35     // Drucksensor P2 an GPIO4
+#define Q_SENSOR_PIN 33     // Q-Sensor an GPIO16 (digital, PWM-Signal)
+#define BUTTON_PIN 23       // Button an GPIO23 (aktiv LOW, interner Pullup)
+
+// ----- Kalibrierungswerte für die Drucksensoren -----
+#define P1_SLOPE 0.0015
+#define P1_INTERCEPT -0.4065
+#define P2_SLOPE 0.0015
+#define P2_INTERCEPT -0.435
+
+// ----- Messintervall -----
+#define MEASUREMENT_INTERVAL 500  // 500 ms
+
+// ----- Globale Variablen -----
+bool experimentRunning = false;       // Zustand des aktuellen Experiments
+unsigned long experimentStartTime = 0;  // Startzeit des aktuellen Experiments
+unsigned long lastMeasurementTime = 0;  // Letzte Messung (für CSV-Log)
+String dataLog = "";                    // CSV-Datenlog (bleibt im RAM)
+int experimentCount = 0;                // Zähler für die Experimente
+
+// Variablen für Button-Debounce
+bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
+// Webserver (ESP32 im Access Point-Modus)
+WebServer server(80);
+
+// Display-Initialisierung (SSD1306 über Hardware I2C)
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// Hilfsfunktion: Formatiert einen Float als String mit Komma als Dezimaltrennzeichen
+String formatFloat(float value, int decimals) {
+  char buf[20];
+  dtostrf(value, 0, decimals, buf);
+  for (int i = 0; i < strlen(buf); i++) {
+    if (buf[i] == '.') buf[i] = ',';
+  }
+  return String(buf);
+}
+
+// Webserver-Handler: Liefert den CSV-Datenlog
+void handleRoot() {
+  server.send(200, "text/plain", dataLog);
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Sensor- und Button-Pins konfigurieren
+  pinMode(SENSOR_P1_PIN, INPUT);
+  pinMode(SENSOR_P2_PIN, INPUT);
+  pinMode(Q_SENSOR_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  // Display initialisieren
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(0, 10, "Systemstart...");
+  u8g2.sendBuffer();
+  delay(2000);
+  
+  // ESP32 als Access Point konfigurieren (SSID "ESP32_Experiment", PW "12345678")
+  WiFi.softAP("ESP32_Experiment", "12345678");
+  Serial.println("Access Point gestartet. Verbinde dich mit 'ESP32_Experiment'.");
+  Serial.print("IP-Adresse: ");
+  Serial.println(WiFi.softAPIP());
+  
+  // Webserver einrichten
+  server.on("/", handleRoot);
+  server.begin();
+  Serial.println("Webserver gestartet.");
+}
+
+void loop() {
+  // Webserver-Clients abarbeiten
+  server.handleClient();
+  
+  // Button auslesen
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+  // Prüfe auf einen Wechsel von HIGH zu LOW (Taster gedrückt)
+  if (currentButtonState == LOW && lastButtonState == HIGH && (millis() - lastDebounceTime > debounceDelay)) {
+    lastDebounceTime = millis();
+    // Toggle Experimentmodus
+    experimentRunning = !experimentRunning;
+    if (experimentRunning) {
+      experimentCount++;
+      experimentStartTime = millis();
+      lastMeasurementTime = millis();
+      dataLog += "Experiment " + String(experimentCount) + "\n";
+      dataLog += "Zeit (s);P1_ADC;P1_bar;P2_ADC;P2_bar;Freq_Hz;Q_l_min\n";
+      Serial.println("Experiment gestartet.");
+    } else {
+      dataLog += "\n";
+      Serial.println("Experiment beendet.");
+    }
+    // Warten, bis der Button wieder losgelassen wird
+    while (digitalRead(BUTTON_PIN) == LOW) {
+      delay(10);
+    }
+  }
+  lastButtonState = currentButtonState;
+  
+  // Aktuelle Sensorwerte messen (immer, um sie im Display anzuzeigen)
+  int rawP1 = analogRead(SENSOR_P1_PIN);
+  int rawP2 = analogRead(SENSOR_P2_PIN);
+  float p1_bar = P1_SLOPE * rawP1 + P1_INTERCEPT;
+  float p2_bar = P2_SLOPE * rawP2 + P2_INTERCEPT;
+  
+  unsigned long highTime = pulseIn(Q_SENSOR_PIN, HIGH, 100000);
+  unsigned long lowTime  = pulseIn(Q_SENSOR_PIN, LOW, 100000);
+  float frequency = 0;
+  if (highTime > 0 && lowTime > 0) {
+    frequency = 1000000.0 / (highTime + lowTime);
+  }
+  float Q_l_min = frequency / 4.8;
+  
+  // Wenn Experiment läuft, alle 0,5 s Daten ins CSV-Log schreiben
+  if (experimentRunning && (millis() - lastMeasurementTime >= MEASUREMENT_INTERVAL)) {
+    lastMeasurementTime = millis();
+    float elapsedTime = (millis() - experimentStartTime) / 1000.0;
+    String line = "";
+    line += formatFloat(elapsedTime, 1) + ";";
+    line += String(rawP1) + ";";
+    line += formatFloat(p1_bar, 2) + ";";
+    line += String(rawP2) + ";";
+    line += formatFloat(p2_bar, 2) + ";";
+    line += formatFloat(frequency, 2) + ";";
+    line += formatFloat(Q_l_min, 2) + "\n";
+    dataLog += line;
+    
+    Serial.print("Zeit: ");
+    Serial.print(formatFloat(elapsedTime, 1));
+    Serial.print(" s, P1: ");
+    Serial.print(rawP1);
+    Serial.print(" (");
+    Serial.print(formatFloat(p1_bar, 2));
+    Serial.print(" bar), P2: ");
+    Serial.print(rawP2);
+    Serial.print(" (");
+    Serial.print(formatFloat(p2_bar, 2));
+    Serial.print(" bar), Freq: ");
+    Serial.print(formatFloat(frequency, 2));
+    Serial.print(" Hz, Q: ");
+    Serial.print(formatFloat(Q_l_min, 2));
+    Serial.println(" l/min");
+  }
+  
+  // Display aktualisieren: Zeige aktuelle Messwerte
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  
+  char buffer[30];
+  snprintf(buffer, sizeof(buffer), "P1: %.2f bar", p1_bar);
+  u8g2.drawStr(0, 12, buffer);
+  snprintf(buffer, sizeof(buffer), "P2: %.2f bar", p2_bar);
+  u8g2.drawStr(0, 28, buffer);
+  snprintf(buffer, sizeof(buffer), "Freq: %.2f Hz", frequency);
+  u8g2.drawStr(0, 44, buffer);
+  snprintf(buffer, sizeof(buffer), "Q: %.2f l/min", Q_l_min);
+  u8g2.drawStr(0, 60, buffer);
+  
+  // Wenn Experiment läuft, zeige oben rechts die verstrichene Zeit
+  if (experimentRunning) {
+    float elapsedTime = (millis() - experimentStartTime) / 1000.0;
+    String timeStr = "T:" + formatFloat(elapsedTime, 1) + " s";
+    u8g2.drawStr(80, 10, timeStr.c_str());
+  }
+  
+  u8g2.sendBuffer();
+  delay(10);
+}
